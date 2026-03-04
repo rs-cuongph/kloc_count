@@ -6,8 +6,9 @@ Built with Python + tkinter. Cross-platform: **Windows** & **macOS**.
 
 ## Features
 
-- **Auto-detect project type** — Reads `package.json`, `pubspec.yaml`, `Gemfile`, `composer.json` to identify frameworks
-- **Multi-select project types** — Flutter, NodeJs, ReactJs, NextJs, NuxtJs, VueJs, RubyOnRail, Laravel
+- **Auto-detect project type** — Reads `package.json`, `pubspec.yaml`, `Gemfile`, `pyproject.toml`, etc. to identify frameworks
+- **Multi-select project types** — Flutter, NodeJs, ReactJs, NextJs, NuxtJs, VueJs, RubyOnRail, Laravel, Python
+- **Branch selection** — Auto-detects default branch or choose from autocomplete dropdown
 - **Date range picker** — Calendar-based date selection with clear button
 - **Commit regex filter** — Filter commits with regex (includes suggestion dropdown)
 - **Monthly KLOC breakdown** — Cumulative KLOC per month
@@ -34,7 +35,7 @@ Built with Python + tkinter. Cross-platform: **Windows** & **macOS**.
 pip install -r requirements.txt
 
 # Run the app
-python app.py
+bash run.sh
 ```
 
 ## Build Portable Executable
@@ -56,10 +57,12 @@ Output will be in the `dist/` folder:
 ## Usage
 
 1. **Path** — Click `Browse` to select a Git repository folder
-2. **Commit Regex** — (Optional) Enter a regex to filter commits. Click the field for suggestions
-3. **Project Type** — Select one or more project types (auto-detected on folder selection)
-4. **Date** — (Optional) Pick a date range. Leave empty to count from first to last commit
-5. **Count KLOC** — Click to start counting
+2. **Branch** — Auto-detected on folder selection. You can also type to search/filter branches
+3. **Commit Regex** — (Optional) Enter a regex to filter commits. Click the field for suggestions
+4. **Project Type** — Select one or more project types (auto-detected on folder selection)
+5. **Date** — (Optional) Pick a date range. Leave empty to count from first to last commit
+6. **Count KLOC** — Click to start counting
+7. **Feedback** — Click the 💬 Feedback button in the top right to open the issues page
 
 ### Result Format
 
@@ -79,6 +82,7 @@ Project Type: Flutter
 kloc_count_tool/
 ├── app.py              # Main application (GUI + logic)
 ├── requirements.txt    # Python dependencies
+├── run.sh              # Script to restart/run the app safely
 ├── build.sh            # Build script for portable executables
 └── README.md
 ```
