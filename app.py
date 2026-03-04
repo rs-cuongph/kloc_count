@@ -63,6 +63,11 @@ EXCLUDE_RULES = {
         "exts": "log,lock,min.js,min.css,svg,png,jpg,jpeg,gif,ico",
         "match": "",
     },
+    "Python": {
+        "dirs": "__pycache__,.venv,venv,.env,env,node_modules,.pytest_cache,.mypy_cache,.tox,dist,build,*.egg-info,.git,.ruff_cache",
+        "exts": "pyc,pyo,log,lock,min.js,min.css,svg,png,jpg,jpeg,gif,ico",
+        "match": "",
+    },
 }
 
 PROJECT_TYPES = list(EXCLUDE_RULES.keys())
@@ -140,6 +145,11 @@ def detect_project_types(path):
         except (OSError, json.JSONDecodeError):
             detected.add("NodeJs")
 
+    # Python
+    python_markers = {"requirements.txt", "setup.py", "pyproject.toml", "pipfile", "manage.py", "setup.cfg"}
+    if python_markers.intersection(files):
+        detected.add("Python")
+
     return detected
 
 
@@ -149,9 +159,10 @@ def detect_project_types(path):
 class KlocCounter:
     """Handles git + cloc operations."""
 
-    def __init__(self, repo_path, project_types, commit_regex="", log_callback=None):
+    def __init__(self, repo_path, project_types, branch="", commit_regex="", log_callback=None):
         self.repo_path = repo_path
         self.project_types = project_types  # list of selected types
+        self.branch = branch.strip() if branch else ""
         self.commit_regex = commit_regex.strip() if commit_regex else ""
         self.log = log_callback or (lambda msg: None)
 
@@ -174,17 +185,45 @@ class KlocCounter:
 
     def _run(self, cmd, cwd=None):
         self.log(f"> {' '.join(cmd)}")
-        result = subprocess.run(
-            cmd, capture_output=True, text=True,
-            cwd=cwd or self.repo_path,
-            shell=(sys.platform == "win32"),
-        )
+
+        # Resolve executable full path (handles .cmd/.bat on Windows)
+        resolved = shutil.which(cmd[0])
+        if resolved:
+            cmd = [resolved] + cmd[1:]
+
+        # On Windows, .cmd/.bat files always run through cmd.exe internally,
+        # even without shell=True. Special chars like ( ) | in arguments
+        # (e.g. --not-match-f regex) get interpreted by cmd.exe.
+        # Fix: double-quote args with special chars and use shell=True.
+        _cmd_special = set('()|&<>^')
+        if (sys.platform == "win32" and resolved
+                and resolved.lower().endswith(('.cmd', '.bat'))):
+            quoted = []
+            for arg in cmd:
+                if any(c in arg for c in _cmd_special):
+                    quoted.append(f'"{arg}"')
+                else:
+                    quoted.append(arg)
+            result = subprocess.run(
+                ' '.join(quoted), capture_output=True, text=True,
+                cwd=cwd or self.repo_path, shell=True,
+            )
+        else:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                cwd=cwd or self.repo_path,
+            )
+
         if result.returncode != 0 and result.stderr:
             self.log(f"  stderr: {result.stderr.strip()}")
         return result.stdout.strip()
 
     def _git_log_latest(self, after=None, before=None):
-        cmd = ["git", "log", "--all"]
+        cmd = ["git", "log"]
+        if self.branch:
+            cmd.append(self.branch)
+        else:
+            cmd.append("--all")
         if self.commit_regex and self.commit_regex != ".":
             cmd += [f"--grep={self.commit_regex}", "--regexp-ignore-case"]
         if after:
@@ -211,9 +250,12 @@ class KlocCounter:
                 "git", "archive", "--format=zip",
                 "--output", zip_path, commit_hash,
             ]
+            git_path = shutil.which("git")
+            if git_path:
+                archive_cmd[0] = git_path
             result = subprocess.run(
                 archive_cmd, capture_output=True, text=True,
-                cwd=self.repo_path, shell=(sys.platform == "win32"),
+                cwd=self.repo_path,
             )
             if result.returncode != 0:
                 self.log(f"  git archive failed: {result.stderr.strip()}")
@@ -259,15 +301,17 @@ class KlocCounter:
 
     def get_date_range(self):
         """Get the first and last commit dates from git history."""
+        branch_arg = self.branch if self.branch else "--all"
+
         # First commit date
-        first_cmd = ["git", "log", "--all", "--reverse", "--format=%ai", "-n", "1"]
+        first_cmd = ["git", "log", branch_arg, "--reverse", "--format=%ai", "-n", "1"]
         first_out = self._run(first_cmd)
         if not first_out:
             return None, None
         first_date = first_out.split()[0]  # "2024-01-15 10:30:00 +0700" → "2024-01-15"
 
         # Last commit date
-        last_cmd = ["git", "log", "--all", "--format=%ai", "-n", "1"]
+        last_cmd = ["git", "log", branch_arg, "--format=%ai", "-n", "1"]
         last_out = self._run(last_cmd)
         if not last_out:
             return None, None
@@ -473,6 +517,18 @@ class KlocApp(tk.Tk):
         )
         btn_browse.pack(side="right")
 
+        # ── Row: Branch ──
+        row = tk.Frame(inner, bg=self.BG_CARD)
+        row.pack(fill="x", pady=(0, 12))
+        self._make_label(row, "Branch", width=10).pack(side="left")
+
+        self._all_branches = []  # store all branches for filtering
+        self.combo_branch = ttk.Combobox(
+            row, font=self.FONT, state="normal", width=30,
+        )
+        self.combo_branch.pack(side="left", fill="x", expand=True, ipady=5, padx=(4, 0))
+        self.combo_branch.bind("<KeyRelease>", self._on_branch_keyrelease)
+
         # ── Row: Commit Regex ──
         row_regex = tk.Frame(inner, bg=self.BG_CARD)
         row_regex.pack(fill="x", pady=(0, 12))
@@ -507,16 +563,16 @@ class KlocApp(tk.Tk):
         badge_container = tk.Frame(row, bg=self.BG_CARD)
         badge_container.pack(side="left", fill="x", expand=True, padx=(4, 0))
 
-        # Row 1: first 4 types
+        # Row 1: first 5 types
         badge_row1 = tk.Frame(badge_container, bg=self.BG_CARD)
         badge_row1.pack(fill="x", pady=(0, 6))
-        for pt in PROJECT_TYPES[:4]:
+        for pt in PROJECT_TYPES[:5]:
             self._make_badge(badge_row1, pt)
 
-        # Row 2: last 4 types
+        # Row 2: remaining types
         badge_row2 = tk.Frame(badge_container, bg=self.BG_CARD)
         badge_row2.pack(fill="x")
-        for pt in PROJECT_TYPES[4:]:
+        for pt in PROJECT_TYPES[5:]:
             self._make_badge(badge_row2, pt)
 
         # ── Row: Date (DatePicker) ──
@@ -681,6 +737,7 @@ class KlocApp(tk.Tk):
             self.entry_path.config(fg=self.FG)
             self.entry_path.insert(0, path)
             self._auto_detect(path)
+            self._detect_branch(path)
 
     def _auto_detect(self, path):
         """Auto-detect project types and toggle their badges."""
@@ -691,6 +748,50 @@ class KlocApp(tk.Tk):
             self._append_log(f"Auto-detected: {', '.join(sorted(detected))}")
         else:
             self._append_log("Could not auto-detect project type. Please select manually.")
+
+    def _detect_branch(self, path):
+        """Fetch all branches and set default."""
+        try:
+            git_path = shutil.which("git") or "git"
+
+            # Get all branches (local + remote)
+            result = subprocess.run(
+                [git_path, "branch", "-a", "--format=%(refname:short)"],
+                capture_output=True, text=True, cwd=path,
+            )
+            branches = []
+            for line in result.stdout.strip().splitlines():
+                b = line.strip()
+                if b and "HEAD" not in b:
+                    branches.append(b)
+            self._all_branches = sorted(set(branches))
+            self.combo_branch["values"] = self._all_branches
+
+            # Detect current branch
+            result2 = subprocess.run(
+                [git_path, "symbolic-ref", "--short", "HEAD"],
+                capture_output=True, text=True, cwd=path,
+            )
+            current = result2.stdout.strip()
+            if current:
+                self.combo_branch.set(current)
+                self._append_log(f"Default branch: {current}  ({len(self._all_branches)} branches found)")
+        except Exception:
+            pass
+
+    def _on_branch_keyrelease(self, event):
+        """Filter branch suggestions as user types."""
+        # Ignore navigation/modifier keys
+        if event.keysym in ("Up", "Down", "Left", "Right", "Return",
+                            "Escape", "Tab", "Shift_L", "Shift_R",
+                            "Control_L", "Control_R", "Alt_L", "Alt_R"):
+            return
+        typed = self.combo_branch.get().strip().lower()
+        if not typed:
+            self.combo_branch["values"] = self._all_branches
+        else:
+            filtered = [b for b in self._all_branches if typed in b.lower()]
+            self.combo_branch["values"] = filtered
 
     # ── Log & Result helpers ─────────────────
     def _append_log(self, msg):
@@ -738,6 +839,7 @@ class KlocApp(tk.Tk):
             messagebox.showwarning("Warning", "Please select at least 1 Project Type.")
             return
 
+        branch = self.combo_branch.get().strip()
         commit_regex = self._get_entry_value(self.entry_regex, "Enter commit regex filter")
 
         # Read dates from DateEntry
@@ -770,22 +872,24 @@ class KlocApp(tk.Tk):
         self._set_running(True)
         thread = threading.Thread(
             target=self._run_count,
-            args=(repo_path, list(self._selected_projects), commit_regex,
-                  date_from, date_to, has_dates),
+            args=(repo_path, list(self._selected_projects), branch,
+                  commit_regex, date_from, date_to, has_dates),
             daemon=True,
         )
         thread.start()
 
-    def _run_count(self, repo_path, project_types, commit_regex,
-                   date_from, date_to, has_dates):
+    def _run_count(self, repo_path, project_types, branch,
+                   commit_regex, date_from, date_to, has_dates):
         try:
             counter = KlocCounter(
                 repo_path=repo_path,
                 project_types=project_types,
+                branch=branch,
                 commit_regex=commit_regex,
                 log_callback=self._append_log,
             )
 
+            self._append_log(f"Branch: {branch or '(all)'}")
             self._append_log(f"Project types: {', '.join(sorted(project_types))}")
 
             # If no dates provided, auto-detect from git history
