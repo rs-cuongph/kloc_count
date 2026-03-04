@@ -12,12 +12,45 @@ import subprocess
 import tempfile
 import shutil
 import threading
-from datetime import datetime, date as date_type
+from datetime import datetime
 from calendar import monthrange
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkcalendar import DateEntry
 import webbrowser
+
+
+class FixedDateEntry(DateEntry):
+    """DateEntry that allows empty value and fixes arrow navigation closing popup."""
+
+    def _validate_date(self):
+        if not self.get().strip():
+            return True
+        return super()._validate_date()
+
+    def drop_down(self):
+        if not self.get().strip():
+            self._set_text(self.format_date(self._date))
+        super().drop_down()
+
+    def _on_focus_out_cal(self, event):
+        focus = self.focus_get()
+        if focus is not None:
+            try:
+                if str(focus).startswith(str(self._top_cal)):
+                    self.after(50, self._refocus_calendar)
+                    return
+            except (tk.TclError, AttributeError):
+                pass
+        super()._on_focus_out_cal(event)
+
+    def _refocus_calendar(self):
+        try:
+            if self._top_cal.winfo_ismapped():
+                self._calendar.focus_force()
+        except (tk.TclError, AttributeError):
+            pass
+import zipfile
 
 # ─────────────────────────────────────────────
 # Exclude rules per project type
@@ -161,10 +194,18 @@ class KlocCounter:
 
     def __init__(self, repo_path, project_types, branch="", commit_regex="", log_callback=None):
         self.repo_path = repo_path
-        self.project_types = project_types  # list of selected types
+        self.project_types = project_types
         self.branch = branch.strip() if branch else ""
         self.commit_regex = commit_regex.strip() if commit_regex else ""
         self.log = log_callback or (lambda msg: None)
+
+    def _ref(self):
+        """Return git ref to use for log queries (use local branch/HEAD)."""
+        # After checkout + reset, local branch is already synced to origin/<branch>,
+        # nên chỉ cần dùng chính branch local / HEAD.
+        if self.branch:
+            return self.branch
+        return "HEAD"
 
     def _merged_rules(self):
         """Merge exclude rules from all selected project types."""
@@ -220,10 +261,7 @@ class KlocCounter:
 
     def _git_log_latest(self, after=None, before=None):
         cmd = ["git", "log"]
-        if self.branch:
-            cmd.append(self.branch)
-        else:
-            cmd.append("--all")
+        cmd.append(self._ref())
         if self.commit_regex and self.commit_regex != ".":
             cmd += [f"--grep={self.commit_regex}", "--regexp-ignore-case"]
         if after:
@@ -234,8 +272,6 @@ class KlocCounter:
         return self._run(cmd)
 
     def _cloc_at_commit(self, commit_hash):
-        import zipfile as _zipfile
-
         rules = self._merged_rules()
         tmpdir = tempfile.mkdtemp(prefix="kloc_")
         zip_path = os.path.join(tmpdir, "archive.zip")
@@ -266,7 +302,7 @@ class KlocCounter:
                 self.log("  Warning: git archive produced empty zip")
                 return 0
 
-            with _zipfile.ZipFile(zip_path, 'r') as zf:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
                 zf.extractall(extract_dir)
 
             file_count = sum(1 for _ in _walk_files(extract_dir))
@@ -301,18 +337,33 @@ class KlocCounter:
 
     def get_date_range(self):
         """Get the first and last commit dates from git history."""
-        branch_arg = self.branch if self.branch else "--all"
+        # First commit: use git rev-list to find root commit(s) from current HEAD,
+        # then git show to read its author date in ISO format.
+        # This follows the shell logic:
+        #   git show $(git rev-list --max-parents=0 HEAD) --no-patch \
+        #     --pretty=format:"%h %ad" --date=iso
+        first_hash = self._run(["git", "rev-list", "--max-parents=0", "HEAD"])
+        if not first_hash:
+            return None, None
 
-        # First commit date
-        first_cmd = ["git", "log", branch_arg, "--reverse", "--format=%ai", "-n", "1"]
-        first_out = self._run(first_cmd)
+        first_out = self._run([
+            "git", "show", first_hash.splitlines()[0],
+            "--no-patch",
+            "--pretty=format:%ad",
+            "--date=iso",
+        ])
         if not first_out:
             return None, None
         first_date = first_out.split()[0]  # "2024-01-15 10:30:00 +0700" → "2024-01-15"
 
-        # Last commit date
-        last_cmd = ["git", "log", branch_arg, "--format=%ai", "-n", "1"]
-        last_out = self._run(last_cmd)
+        # Last commit date: use HEAD, same as:
+        #   git show --no-patch --pretty=format:"%h %ad" --date=iso HEAD
+        last_out = self._run([
+            "git", "show", "HEAD",
+            "--no-patch",
+            "--pretty=format:%ad",
+            "--date=iso",
+        ])
         if not last_out:
             return None, None
         last_date = last_out.split()[0]
@@ -389,12 +440,10 @@ class KlocApp(tk.Tk):
     ACCENT = "#e94560"
     ACCENT_HOVER = "#ff6b81"
     BTN_BG = "#233554"
-    BTN_ACTIVE = "#e94560"
     BTN_FG = "#8899aa"
     BTN_FG_ACTIVE = "#ffffff"
     SUCCESS = "#00d2d3"
     BORDER = "#233554"
-    BADGE_DETECTED = "#1dd1a1"  # green tint for auto-detected
 
     FONT_FAMILY = "Segoe UI" if sys.platform == "win32" else "SF Pro Display"
 
@@ -583,23 +632,23 @@ class KlocApp(tk.Tk):
         date_container = tk.Frame(row, bg=self.BG_CARD)
         date_container.pack(side="left", fill="x", expand=True, padx=(4, 0))
 
-        self.date_from = DateEntry(
+        self.date_from = FixedDateEntry(
             date_container, font=self.FONT_SMALL,
             background=self.BG_INPUT, foreground=self.FG,
             borderwidth=0, width=12, date_pattern="yyyy-mm-dd",
         )
-        self.date_from.delete(0, "end")  # start empty
+        self.date_from.delete(0, "end")
         self.date_from.pack(side="left", ipady=5)
 
         tk.Label(date_container, text="  to  ", font=self.FONT,
                  fg=self.FG_DIM, bg=self.BG_CARD).pack(side="left")
 
-        self.date_to = DateEntry(
+        self.date_to = FixedDateEntry(
             date_container, font=self.FONT_SMALL,
             background=self.BG_INPUT, foreground=self.FG,
             borderwidth=0, width=12, date_pattern="yyyy-mm-dd",
         )
-        self.date_to.delete(0, "end")  # start empty
+        self.date_to.delete(0, "end")
         self.date_to.pack(side="left", ipady=5)
 
         btn_clear_date = tk.Button(
@@ -703,8 +752,6 @@ class KlocApp(tk.Tk):
             lbl_desc.pack(side="left", fill="x", expand=True)
 
             for widget in (item, lbl_pattern, lbl_desc):
-                widget.bind("<Enter>", lambda e, i=item: i.config(bg="#2a3f5f"))
-                widget.bind("<Leave>", lambda e, i=item: i.config(bg="#1e2d45"))
                 widget.bind("<Enter>", lambda e, i=item, lp=lbl_pattern, ld=lbl_desc: (
                     i.config(bg="#2a3f5f"), lp.config(bg="#2a3f5f"), ld.config(bg="#2a3f5f")
                 ))
@@ -842,26 +889,9 @@ class KlocApp(tk.Tk):
         branch = self.combo_branch.get().strip()
         commit_regex = self._get_entry_value(self.entry_regex, "Enter commit regex filter")
 
-        # Read dates from DateEntry
+        # Read raw dates from DateEntry (may be empty)
         date_from_str = self.date_from.get().strip()
         date_to_str = self.date_to.get().strip()
-
-        date_from = ""
-        date_to = ""
-        has_dates = False
-
-        if date_from_str and date_to_str:
-            try:
-                df = datetime.strptime(date_from_str, "%Y-%m-%d")
-                dt = datetime.strptime(date_to_str, "%Y-%m-%d")
-                date_from = df.strftime("%Y%m%d")
-                date_to = dt.strftime("%Y%m%d")
-                has_dates = True
-            except ValueError:
-                pass  # treat as no date
-        elif date_from_str or date_to_str:
-            messagebox.showwarning("Warning", "Please select both From and To dates, or clear both.")
-            return
 
         # Clear
         self.log_text.config(state="normal")
@@ -873,14 +903,106 @@ class KlocApp(tk.Tk):
         thread = threading.Thread(
             target=self._run_count,
             args=(repo_path, list(self._selected_projects), branch,
-                  commit_regex, date_from, date_to, has_dates),
+                  commit_regex, date_from_str, date_to_str),
             daemon=True,
         )
         thread.start()
 
     def _run_count(self, repo_path, project_types, branch,
-                   commit_regex, date_from, date_to, has_dates):
+                   commit_regex, date_from_str, date_to_str):
         try:
+            try:
+                git_path = shutil.which("git") or "git"
+
+                # If a branch is selected, checkout/switch to it first
+                if branch:
+                    try:
+                        self._append_log(f"Checking out branch {branch}...")
+                        result_checkout = subprocess.run(
+                            [git_path, "checkout", branch],
+                            capture_output=True,
+                            text=True,
+                            cwd=repo_path,
+                        )
+                        if result_checkout.returncode != 0:
+                            # Try to create local branch tracking origin/<branch>
+                            self._append_log(
+                                f"Local branch {branch} not available. "
+                                f"Trying to create from origin/{branch}..."
+                            )
+                            result_checkout = subprocess.run(
+                                [git_path, "checkout", "-B", branch, f"origin/{branch}"],
+                                capture_output=True,
+                                text=True,
+                                cwd=repo_path,
+                            )
+                            if result_checkout.returncode != 0:
+                                self._append_log(
+                                    f"Warning: git checkout {branch} failed: "
+                                    f"{result_checkout.stderr.strip()}"
+                                )
+
+                    except Exception as e:
+                        self._append_log(f"Warning: git checkout {branch} error: {e}")
+
+                # If repository is shallow, unshallow to get full history
+                try:
+                    result_shallow = subprocess.run(
+                        [git_path, "rev-parse", "--is-shallow-repository"],
+                        capture_output=True,
+                        text=True,
+                        cwd=repo_path,
+                    )
+                    if result_shallow.returncode == 0 and result_shallow.stdout.strip() == "true":
+                        self._append_log("Repository is shallow. Fetching full history (--unshallow)...")
+                        result_unshallow = subprocess.run(
+                            [git_path, "fetch", "--unshallow", "origin"],
+                            capture_output=True,
+                            text=True,
+                            cwd=repo_path,
+                        )
+                        if result_unshallow.returncode != 0:
+                            self._append_log(
+                                f"Warning: git fetch --unshallow origin failed: "
+                                f"{result_unshallow.stderr.strip()}"
+                            )
+                    else:
+                        # Normal fetch to update remote refs
+                        self._append_log("Fetching from origin...")
+                        result = subprocess.run(
+                            [git_path, "fetch", "origin"],
+                            capture_output=True,
+                            text=True,
+                            cwd=repo_path,
+                        )
+                        if result.returncode != 0:
+                            self._append_log(
+                                f"Warning: git fetch origin failed: {result.stderr.strip()}"
+                            )
+                except Exception as e:
+                    self._append_log(f"Warning: git fetch/unshallow error: {e}")
+
+                # After sync, if a branch is selected, hard reset it to origin/<branch>
+                if branch:
+                    try:
+                        self._append_log(f"Resetting local branch to origin/{branch} (hard)...")
+                        result_reset = subprocess.run(
+                            [git_path, "reset", "--hard", f"origin/{branch}"],
+                            capture_output=True,
+                            text=True,
+                            cwd=repo_path,
+                        )
+                        if result_reset.returncode != 0:
+                            self._append_log(
+                                f"Warning: git reset --hard origin/{branch} failed: "
+                                f"{result_reset.stderr.strip()}"
+                            )
+                    except Exception as e:
+                        self._append_log(f"Warning: git reset --hard origin/{branch} error: {e}")
+
+            except Exception as e:
+                self._append_log(f"Warning: git sync with origin error: {e}")
+
             counter = KlocCounter(
                 repo_path=repo_path,
                 project_types=project_types,
@@ -889,17 +1011,89 @@ class KlocApp(tk.Tk):
                 log_callback=self._append_log,
             )
 
-            self._append_log(f"Branch: {branch or '(all)'}")
+            self._append_log(f"Branch: {branch or '(all remotes)'}")
+            if branch:
+                self._append_log(f"Using remote ref: {counter._ref()}")
+            else:
+                self._append_log("Using remote refs only (--remotes)")
             self._append_log(f"Project types: {', '.join(sorted(project_types))}")
 
-            # If no dates provided, auto-detect from git history
-            if not has_dates:
-                self._append_log("No date range specified. Auto-detecting from git history...")
-                date_from, date_to = counter.get_date_range()
-                if not date_from or not date_to:
-                    self._set_result("No commits found in repository.")
+            # Resolve effective date range / mode
+            today = datetime.today().date()
+            today_yyyymmdd = today.strftime("%Y%m%d")
+
+            def _parse_date(s):
+                try:
+                    return datetime.strptime(s, "%Y-%m-%d").date()
+                except (TypeError, ValueError):
+                    return None
+
+            start_dt = _parse_date(date_from_str) if date_from_str else None
+            end_dt = _parse_date(date_to_str) if date_to_str else None
+
+            # Nếu KHÔNG có start date → Mode: total snapshot (không KLOC từng tháng)
+            if not start_dt:
+                # End date hiệu lực: end_dt (nếu có) clamp về today, hoặc today nếu không có
+                effective_end = end_dt or today
+                if effective_end > today:
+                    effective_end = today
+
+                self._append_log(
+                    f"No start date selected. Using total snapshot up to {effective_end.strftime('%Y-%m-%d')}."
+                )
+
+                # Lấy commit mới nhất trước / tại effective_end
+                before_str = effective_end.strftime("%Y-%m-%d")
+                latest_commit = counter._git_log_latest(before=before_str)
+                if not latest_commit:
+                    self._set_result("No commits found up to selected date.")
                     return
-                self._append_log(f"Date range: {date_from} → {date_to}")
+
+                loc = counter._cloc_at_commit(latest_commit)
+                kloc = loc / 1000
+
+                lines = [
+                    f"Mode: Total snapshot",
+                    f"Up to: {effective_end.strftime('%Y%m%d')}",
+                    f"Commit Regex: {commit_regex or '(all)'}",
+                    f"Project Type: {', '.join(sorted(project_types))}",
+                    "",
+                    f"Total: {kloc:.2f} KLOC",
+                ]
+                self._set_result("\n".join(lines))
+                self._append_log("\n✓ Done.")
+                return
+
+            # Có start date → Mode: monthly breakdown
+            # Case 1: only start date selected → from start to today (start must not be in the future)
+            first_commit_yyyymmdd = None
+
+            def _ensure_first_commit():
+                nonlocal first_commit_yyyymmdd
+                if first_commit_yyyymmdd is None:
+                    first_commit_yyyymmdd, _last = counter.get_date_range()
+                return first_commit_yyyymmdd
+
+            if start_dt and not end_dt:
+                if start_dt > today:
+                    messagebox.showwarning("Warning", "Start date cannot be in the future.")
+                    return
+                date_from = start_dt.strftime("%Y%m%d")
+                date_to = today_yyyymmdd
+                self._append_log("Only start date selected. Using start → today.")
+
+            # Case 2: both start and end selected
+            else:
+                if end_dt > today:
+                    end_dt = today
+                if start_dt > end_dt:
+                    messagebox.showwarning("Warning", "Start date cannot be after End date.")
+                    return
+                date_from = start_dt.strftime("%Y%m%d")
+                date_to = end_dt.strftime("%Y%m%d")
+                self._append_log("Both start and end selected. Using provided range (end clamped to today).")
+
+            self._append_log(f"Date range (resolved): {date_from} → {date_to}")
 
             results = counter.count_monthly(date_from, date_to)
             lines = [
